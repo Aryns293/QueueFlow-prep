@@ -150,14 +150,13 @@ Everything you need to learn, understand, and confidently answer **any** questio
 - Automatic retry on failure
 - Max 3 retries (configurable via `max_retries`)
 - Exponential backoff formula: `2000 * 2^retry_count` (2s → 4s → 8s)
-- `setTimeout()` for non-blocking delay (worker continues processing other jobs)
-- `requeueWithDelay()` — schedules LPUSH after delay via setTimeout
+- `scheduleRetry()` — schedules ZADD with due timestamp (score) to DELAYED_QUEUE
+- `promoteDueRetries()` — cron-like check to move due jobs from ZSET back to LIST via ZRANGEBYSCORE
 - Retry count incremented in PostgreSQL before re-queue
 - Job status set back to `queued` during retry
 - Error message stored even on retry (overwritten each attempt)
 - After exhausting retries → `status = 'failed'` (dead-letter)
-- Limitation: setTimeout backoff lives in worker memory, won't survive worker restart mid-backoff
-- Future improvement: Redis Sorted Set (`ZADD`/`ZRANGEBYSCORE`) for persistent delayed queue
+- 100% durable delayed queue using Redis Sorted Sets (`ZSET`) prevents backoff loss on worker crash
 
 ---
 
@@ -179,7 +178,8 @@ Everything you need to learn, understand, and confidently answer **any** questio
 ### Functions
 - `processJob(job)` — simulates work (200ms sleep), 85% random failure rate
 - `handleJob(rawData, redis)` — parses JSON, claims job atomically, runs processJob, handles success/failure
-- `requeueWithDelay(redis, job, delayMs)` — non-blocking delayed re-queue via setTimeout
+- `scheduleRetry(redis, job, delayMs)` — durable delayed re-queue via Redis ZSET
+- `promoteDueRetries(redis)` — promotes ready jobs from ZSET to standard queues
 - `recoverOrphanedJobs(redis)` — startup crash recovery
 - `startWorker()` — main entry: connects Redis, recovers orphans, enters infinite loop
 
@@ -298,7 +298,7 @@ Everything you need to learn, understand, and confidently answer **any** questio
 
 ## 15. Simulation Script (`simulate.js`)
 
-- Fires 50 jobs with random types and weighted priorities
+- Fires massive concurrency payloads (1,000 to 10,000+ jobs) with random types and weighted priorities
 - `PRIORITY_WEIGHTS` — 20% high, 70% normal, 10% low
 - `randomPriority()` — weighted random selection using cumulative probability
 - Uses `axios.post()` to hit the API (not direct DB/Redis access)
@@ -339,7 +339,7 @@ Everything you need to learn, understand, and confidently answer **any** questio
 
 ### Utility Functions
 - `normalizeJob(job)` — sanitize status/priority to known values
-- `timeAgo(dateStr)` — relative time string (5s, 3m, 2h, 1d)
+- `timeAgo(dateStr)` — exact-second relative time string (0s, 1s, 2s) for visual backoff validation
 - `relativeTime(dateStr)` — "5s ago" or "just now"
 - `formatDateTime(dateStr)` — locale-aware full date string
 - `formatDuration(seconds)` — human-readable duration
@@ -364,7 +364,8 @@ Everything you need to learn, understand, and confidently answer **any** questio
 - `previousJobsRef` — ref holding previous jobs array for diff
 
 ### Dashboard Features
-- Polling every 3 seconds (`setInterval`)
+- **WebSockets** for zero-latency real-time state synchronization (Socket.io)
+- Strict `LIMIT 200` UI safeguard preventing browser crash on massive 10,000+ job datasets
 - Pipeline view (Kanban-style: Queued → Processing → Completed → Failed)
 - Metric cards (Queued, Processing, Success Rate, Avg Time)
 - Priority mix bar chart (proportional bar per priority)
