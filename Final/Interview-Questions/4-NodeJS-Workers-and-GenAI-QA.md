@@ -1,0 +1,105 @@
+# Interview Q&A: Node.js Workers & GenAI (Questions 76-100)
+
+This section covers the underlying Node.js runtime mechanics, horizontal scaling strategies, and how to answer modern interview questions regarding the integration of Generative AI (LLMs) into asynchronous architectures.
+
+---
+
+### Q76: "How can a single-threaded Node.js worker handle multiple background tasks simultaneously?"
+**Exact Script:**
+"Node.js is single-threaded for JavaScript execution, but it offloads I/O tasks to the libuv C++ thread pool or the operating system. If my worker starts a 10-second GenAI inference call via `fetch()`, the Node Event Loop doesn't freeze. It suspends that specific async function and continues executing other tasks—such as responding to a Redis Pub/Sub message or running the maintenance `setInterval`. This non-blocking I/O model allows a single Node instance to orchestrate thousands of concurrent network-bound jobs."
+
+### Q77: "Why use a `while(true)` loop in your worker instead of `setInterval`?"
+**Exact Script:**
+"`setInterval` creates a polling architecture. If I set it to 1,000ms, the worker is idle for a full second even if 100 jobs arrive. If I set it to 1ms, it burns CPU. A `while(true)` loop combined with `BRPOP` achieves true event-driven blocking. The loop executes, hits the `await BRPOP`, and the V8 engine suspends the loop completely. The loop only iterates the exact millisecond a job arrives, giving me maximum throughput with absolute minimal CPU waste."
+
+### Q78: "How does the Node.js Event Loop interact with your Promise-based `sleep()` function?"
+**Exact Script:**
+"My `sleep` function is written as `new Promise(resolve => setTimeout(resolve, ms))`. When I `await` this promise, the Event Loop registers a timer with the OS and immediately suspends the execution context of the `processJob` function. The Event Loop is now free to process other events, like incoming HTTP requests or database callbacks. Once the timer expires, the OS notifies the Event Loop, which pushes the `resolve` callback onto the microtask queue to resume execution."
+
+### Q79: "What happens if a fatal unhandled exception occurs inside your worker process?"
+**Exact Script:**
+"If a synchronous error is thrown outside of a `try/catch` block, Node.js triggers an `uncaughtException` and crashes the entire process. To prevent this, my main `runWorkerLoop` is wrapped in a massive `try/catch`. If an unexpected error occurs, it catches it, logs 'Worker loop error', sleeps for 2 seconds to prevent aggressive spinning, and then the `while(true)` loop restarts the next iteration seamlessly. In production, I would use a process manager like PM2 or Docker restart policies for ultimate resilience."
+
+### Q80: "How would you integrate a GenAI model (like OpenAI) into this system?"
+**Exact Script:**
+"Generative AI inferences take a notoriously long time. Integrating them into synchronous APIs results in 504 Gateway Timeouts. I would place the OpenAI API call inside the worker's `processJob` function. The Express API instantly returns the job ID. The worker handles the heavy 30-second inference. Once the LLM returns the generated text, the worker saves it to the PostgreSQL `JSONB` payload and fires a Redis Pub/Sub event to instantly stream the result down to the user's React frontend."
+
+### Q81: "How does QueueFlow protect against OpenAI Rate Limits (429 Too Many Requests)?"
+**Exact Script:**
+"If 10,000 users request AI generations at once, QueueFlow buffers them in Redis. I can strictly control throughput by limiting the number of worker nodes or applying a concurrency cap inside the Node process. If we still hit a 429 error, the worker's `catch` block intercepts it. It utilizes my Exponential Backoff system, calculating a mathematical delay (`2s, 4s, 8s`), and schedules the retry in the Redis ZSET. This gives the OpenAI API time to recover without dropping the user's prompt."
+
+### Q82: "AI inference can be expensive. How do you prevent endless retries?"
+**Exact Script:**
+"Because LLM tokens cost money, infinite retries are dangerous. My PostgreSQL state machine tracks `retry_count`. I set `max_retries` to a low number, like 3. If the LLM call fails 3 times, the worker updates the PostgreSQL status to `failed`. This permanently stops the retries, acting as a financial circuit breaker. The job moves to the Dead Letter Queue, where I can manually investigate if the prompt violated safety guidelines."
+
+### Q83: "How do you handle AI 'Hallucinations' or malformed JSON responses?"
+**Exact Script:**
+"LLMs are non-deterministic. If I ask for JSON, they might return markdown blocks. In `processJob`, I would wrap the JSON parsing of the AI's response in a `try/catch`. If the parsing fails, I consider the generation a failure. The job falls into the Exponential Backoff pipeline and retries, hoping the next inference produces valid JSON. If it repeatedly fails, it hits the DLQ."
+
+### Q84: "What is Human-in-the-Loop (HITL) and how would you add it?"
+**Exact Script:**
+"HITL is critical for high-stakes AI outputs to prevent brand damage. I would add a `pending_review` state to my PostgreSQL enum. When the worker finishes the AI generation, instead of marking it `completed`, it marks it `pending_review`. A human moderator views the job on an internal dashboard, edits any hallucinated text, and clicks 'Approve'. This triggers an Express endpoint that updates the database to `completed` and signals the end user."
+
+### Q85: "How does your worker handle Backpressure?"
+**Exact Script:**
+"Backpressure is the ability of a system to resist being overwhelmed by traffic. In QueueFlow, the Express API (Producer) is incredibly fast because it just writes to Postgres and Redis. The workers (Consumers) naturally apply backpressure because they only pull one job at a time via `BRPOP`. If the workers are busy doing 45-second AI inferences, they stop pulling. The jobs safely buffer in the Redis Lists and Postgres database until the workers are free."
+
+### Q86: "Could you use Serverless functions (AWS Lambda) for the workers?"
+**Exact Script:**
+"Using Serverless for workers is tricky. AWS Lambda has a maximum execution time of 15 minutes, and if you use SQS, it scales up thousands of Lambdas concurrently. This sounds great, but it instantly destroys downstream databases by opening thousands of Postgres connections. Also, Serverless doesn't support the persistent, long-lived TCP connections required for `BRPOP`. I prefer long-running Docker containers on ECS or EKS for workers, allowing strict connection pooling and concurrency control."
+
+### Q87: "How would you deploy this backend architecture to the cloud?"
+**Exact Script:**
+"I would containerize the Node.js apps using Docker. The Express API (`app.js`) would be deployed on a scalable container service like AWS ECS Fargate or Kubernetes behind an Application Load Balancer. The workers (`worker.js`) would be deployed as headless background containers on the same cluster. I would use managed services for the infrastructure: AWS RDS for PostgreSQL and Amazon ElastiCache for Redis, guaranteeing automated backups and high availability."
+
+### Q88: "What environment variables are critical to secure in your system?"
+**Exact Script:**
+"The two most critical variables are `DATABASE_URL` (Postgres) and `REDIS_URL`. If a bad actor gains access to these, they can dump the entire database or wipe the Redis cache. In a production environment, I would never store these in a `.env` file on the server. I would use a secure vault like AWS Secrets Manager or HashiCorp Vault. The Node.js application would fetch these secrets dynamically at runtime."
+
+### Q89: "How do you trace a job across the API and the Worker?"
+**Exact Script:**
+"I generate a global UUID in the Express API the millisecond the request arrives. This UUID is logged by the API, saved in Postgres, pushed to Redis, and eventually logged by the worker (`console.log('Done job ' + job.id)`). By forwarding all stdout logs from my Docker containers to a centralized logging system like Datadog, I can search for a single UUID and see the exact timeline of the job across multiple separate servers."
+
+### Q90: "Why use a UUID instead of a sequentially auto-incrementing integer?"
+**Exact Script:**
+"In distributed systems, if you rely on the database to auto-increment an ID, you don't know the ID until the database responds. This makes it impossible to trace the request before the database interaction. Furthermore, if you use a clustered database, generating sequential IDs causes locking bottlenecks. A UUID v4 can be safely generated in memory by any Express API node instantly, guaranteeing global uniqueness without talking to the database."
+
+### Q91: "How would you test this architecture?"
+**Exact Script:**
+"I would write Integration Tests using Jest and Supertest. I'd spin up local Docker containers for Redis and Postgres using Testcontainers. My tests would POST a job, then query the database to verify it was inserted, and query Redis to verify it was pushed. I would also write chaotic tests where I intentionally close the Redis connection mid-test to ensure the `recoverMissingQueuedJobs` loop successfully heals the system."
+
+### Q92: "Explain the `JOB_FAILURE_RATE` environment variable in your worker."
+**Exact Script:**
+"Distributed systems are unpredictable, but when you run them on localhost, everything works perfectly. To truly test my Exponential Backoff and Dead Letter Queue systems, I built a chaos engineering variable called `JOB_FAILURE_RATE`. By setting it to `0.75`, my `processJob` function intentionally throws an error 75% of the time. This forces my local system to aggressively trigger retries, simulating a degraded downstream API."
+
+### Q93: "What is the purpose of the `numberFromEnv` helper function?"
+**Exact Script:**
+"Environment variables are always read as strings in Node.js. If I configure `BRPOP_TIMEOUT_SECONDS=5`, Node reads it as `'5'`. If I pass a string into a math calculation or a Redis configuration, it can cause silent bugs or crashes. My `numberFromEnv` function safely parses the string into an integer, provides a fallback default, and enforces min/max boundaries to prevent accidental misconfigurations from crashing the worker."
+
+### Q94: "How does the API handle Cross-Origin Resource Sharing (CORS)?"
+**Exact Script:**
+"My React frontend runs on a different port (or domain) than my Express backend. Browsers enforce the Same-Origin Policy, which blocks JavaScript from making API calls to different domains. By importing and using the `cors` middleware in Express (`app.js`), my server automatically attaches the `Access-Control-Allow-Origin` headers to the HTTP responses, telling the user's browser that the React frontend is permitted to communicate with it."
+
+### Q95: "If your worker processes sensitive user data, how do you handle privacy?"
+**Exact Script:**
+"If the `JSONB` payload contains Personally Identifiable Information (PII) like emails or medical records, I cannot store it in plain text in PostgreSQL, nor push it over the network to Redis in plain text. I would encrypt the sensitive fields at the application layer in `app.js` using AES-256 before `JSON.stringify`ing it. The worker would decrypt it in memory, process it, and immediately drop it. The database and Redis would only ever store ciphertexts."
+
+### Q96: "What is WebSockets, and why use Socket.io instead of native WebSockets?"
+**Exact Script:**
+"Native WebSockets provide a persistent, bi-directional TCP connection, but they are low-level. If a user's internet drops while walking out of a building, native WebSockets just die. Socket.io provides automatic reconnection, connection fallbacks (like HTTP Long Polling if firewalls block WebSockets), and built-in 'Rooms' which allow me to easily broadcast messages only to specific users rather than everyone on the server."
+
+### Q97: "Can a user cancel a job that is already in the queue?"
+**Exact Script:**
+"Currently, no. But to implement it, I would add a `DELETE /jobs/:id` endpoint. It would update the PostgreSQL status to `cancelled`. When the worker pulls the job from Redis, it executes the Atomic Lock (`UPDATE ... WHERE status = 'queued'`). Because the status is now `cancelled`, the lock fails, the worker silently drops the payload, and the job is never processed. This is the beauty of the Database-First architecture."
+
+### Q98: "How does the Node.js process handle a SIGTERM signal during deployment?"
+**Exact Script:**
+"During a new deployment, Kubernetes sends a `SIGTERM` signal to kill the old container. If I just let it die, any job currently being processed is killed mid-flight. To handle this gracefully, I would attach a `process.on('SIGTERM')` listener. It would flip a boolean `isShuttingDown = true`. The `while(true)` loop would check this boolean before calling `BRPOP`. It would finish the current job, refuse to pull a new one, and cleanly exit the process."
+
+### Q99: "What is the difference between Concurrency and Parallelism in this architecture?"
+**Exact Script:**
+"Parallelism is literally executing multiple tasks at the exact same time, which requires multiple CPU cores. Node.js is single-threaded, so a single worker process cannot do true parallelism for CPU tasks. However, it excels at Concurrency—managing multiple tasks in overlapping periods. A single Node worker can manage 100 concurrent network requests to OpenAI. To achieve true Parallelism, I horizontally scale by spinning up 10 separate Docker containers (worker processes)."
+
+### Q100: "What was the most valuable lesson you learned building QueueFlow?"
+**Exact Script:**
+"I learned that failure is the normal state of a distributed system. When building simple CRUD apps, you assume the database is always online and the API always works. Building QueueFlow taught me Defensive Engineering. I had to assume Redis would wipe its RAM, workers would randomly lose power, and external APIs would rate-limit me. By engineering atomic locks, exponential backoff, and reaper loops, I learned how to build systems that guarantee reliability in an unreliable environment."
